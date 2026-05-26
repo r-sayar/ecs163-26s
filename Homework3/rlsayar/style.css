@@ -169,17 +169,11 @@ body {
   cursor: pointer;
 }
 
-/* ── HW3: d3.brush overlay styling ───────────────────────── */
-.brush-layer .selection {
-  fill: #6390F0;
-  fill-opacity: 0.12;
-  stroke: #6390F0;
-  stroke-width: 1.5px;
-}
-.brush-layer .handle {
-  fill: #6390F0;
-  fill-opacity: 0.5;
-}
+/* ── HW3: lasso selection (fill/stroke set inline in JS) ──── */
+.lasso-path { pointer-events: none; }
+
+/* ── HW3: type convex hull polygons ──────────────────────── */
+.type-hull  { pointer-events: none; }
 
 /* ── HW3: selected dot ring ───────────────────────────────── */
 .dot.selected {

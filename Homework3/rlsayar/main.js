@@ -184,7 +184,10 @@ d3.csv('data/pokemon.csv', r => ({
   total:      +r.Total,
   hp:         +r.HP,         attack: +r.Attack, defense: +r.Defense,
   spAtk:      +r['Sp. Atk'], spDef:  +r['Sp. Def'], speed: +r.Speed,
-  generation: +r.Generation
+  generation: +r.Generation,
+  // Composite axes: offence = Attack + Sp.Atk, defence = HP + Defense + Sp.Def
+  offence: +r.Attack + +r['Sp. Atk'],
+  defence: +r.HP     + +r.Defense   + +r['Sp. Def']
 })).then(raw => {
   const seen = new Set();
   pokemonData = raw.filter(d => { if (seen.has(d.name)) return false; seen.add(d.name); return true; });
@@ -335,11 +338,11 @@ function drawScatter(data) {
   const svg = d3.select('#scatter-plot').append('svg').attr('width', W).attr('height', H);
   const g   = svg.append('g').attr('transform', `translate(${m.left},${m.top})`);
 
-  // Base scales (never mutated; zoom rescales copies of these)
+  // Composite axes: offence = Attack + Sp.Atk  |  defence = HP + Defense + Sp.Def
   const baseXScale = d3.scaleLinear()
-    .domain([0, d3.max(data, d => d.attack) + 15]).range([0, iW]);
+    .domain([0, d3.max(data, d => d.offence) + 20]).range([0, iW]);
   const baseYScale = d3.scaleLinear()
-    .domain([0, d3.max(data, d => d.defense) + 15]).range([iH, 0]);
+    .domain([0, d3.max(data, d => d.defence) + 20]).range([iH, 0]);
   const rScale = d3.scaleSqrt()
     .domain(d3.extent(data, d => d.total)).range([2.5, 9]);
 
@@ -351,23 +354,31 @@ function drawScatter(data) {
   // Pre-compute targets for every mode (so morph is instant)
   const typeAvgsMap = new Map();
   d3.rollup(data, v => ({
-    type: v[0].type1, count: v.length,
-    attack: d3.mean(v, d => d.attack),
+    type:    v[0].type1, count: v.length,
+    attack:  d3.mean(v, d => d.attack),
     defense: d3.mean(v, d => d.defense),
-    total: d3.mean(v, d => d.total)
+    offence: d3.mean(v, d => d.offence),
+    defence: d3.mean(v, d => d.defence),
+    total:   d3.mean(v, d => d.total)
   }), d => d.type1).forEach((v, k) => typeAvgsMap.set(k, v));
   const typeAvgsArr = [...typeAvgsMap.values()];
 
   const { centroids, labels } = kMeans(data, 5);
+  // Add composite values to k-means centroids
+  centroids.forEach((c, ci) => {
+    const members = data.filter((_, i) => labels[i] === ci);
+    c.offence = d3.mean(members, d => d.offence);
+    c.defence = d3.mean(members, d => d.defence);
+  });
   const countScale = d3.scaleSqrt()
     .domain([0, d3.max(centroids, d => d.count)]).range([14, 30]);
 
-  // Data-space position for a dot in a given mode (mode-aware, zoom-independent)
+  // Data-space position for a dot (uses composite offence/defence axes)
   function dataPos(d, i, mode) {
-    if (mode === 'all')  return { a: d.attack, e: d.defense };
-    if (mode === 'type') { const a = typeAvgsMap.get(d.type1); return { a: a.attack, e: a.defense }; }
+    if (mode === 'all')  return { a: d.offence, e: d.defence };
+    if (mode === 'type') { const a = typeAvgsMap.get(d.type1); return { a: a.offence, e: a.defence }; }
     const c = centroids[labels[i]];
-    return { a: c.attack, e: c.defense };
+    return { a: c.offence, e: c.defence };
   }
   function rFor(d, i, mode) {
     if (mode === 'all') return rScale(d.total);
@@ -376,26 +387,30 @@ function drawScatter(data) {
   }
   function defaultOp(mode) {
     if (mode === 'all') return 0.65;
-    if (mode === 'type') return 0.22;
+    if (mode === 'type') return 0.12;   // hull mode: dots are just faint context
     return 0.18;
   }
 
-  // ATK = DEF reference line (kept as a class so zoom can update it)
-  const refMax = Math.min(d3.max(data, d => d.attack), d3.max(data, d => d.defense));
+  // Balanced reference diagonal: defence = offence + meanHP
+  // Defence has 3 stats (HP + Def + SpDef); offence has 2 (Atk + SpAtk).
+  // A "balanced" Pokémon has defence ≈ offence + meanHP, so we shift the
+  // diagonal up by the average HP so the reference is meaningful.
+  const meanHP   = d3.mean(data, d => d.hp);
+  const diagEndX = Math.min(d3.max(data, d => d.offence), d3.max(data, d => d.defence) - meanHP);
   const atkDefLine = g.append('line').attr('class', 'atk-def-line')
-    .attr('x1', xScale(0)).attr('y1', yScale(0))
-    .attr('x2', xScale(refMax)).attr('y2', yScale(refMax))
+    .attr('x1', xScale(0)).attr('y1', yScale(meanHP))
+    .attr('x2', xScale(diagEndX)).attr('y2', yScale(diagEndX + meanHP))
     .attr('stroke', '#ccc').attr('stroke-dasharray', '5,4').attr('stroke-width', 1);
   const atkDefLabel = g.append('text').attr('class', 'atk-def-label')
-    .attr('x', xScale(refMax) - 4).attr('y', yScale(refMax) - 6)
+    .attr('x', xScale(diagEndX) - 4).attr('y', yScale(diagEndX + meanHP) - 6)
     .attr('fill', '#aaa').attr('font-size', '10px').attr('text-anchor', 'end')
-    .text('ATK = DEF');
+    .text('Balanced (offence ≈ defence)');
 
   // ── OUTLIER LABELS (Individual mode only — hidden in other modes) ──
-  const maxAtk = d3.max(data, d => d.attack);
-  const maxDef = d3.max(data, d => d.defense);
-  const topByAtk = [...data].sort((a,b) => b.attack - a.attack).slice(0, 5);
-  const topByDef = [...data].sort((a,b) => b.defense - a.defense).slice(0, 5);
+  const maxAtk = d3.max(data, d => d.offence);
+  const maxDef = d3.max(data, d => d.defence);
+  const topByAtk = [...data].sort((a,b) => b.offence - a.offence).slice(0, 5);
+  const topByDef = [...data].sort((a,b) => b.defence - a.defence).slice(0, 5);
   const outlierSet = new Map();
   [...topByAtk, ...topByDef].forEach(d => { if (!outlierSet.has(d.name)) outlierSet.set(d.name, d); });
   const outlierG = g.append('g').attr('class', 'outlier-layer')
@@ -403,77 +418,63 @@ function drawScatter(data) {
   outlierSet.forEach(d => {
     outlierG.append('text')
       .attr('class', 'outlier-label')
-      .attr('x', baseXScale(d.attack) + (d.attack > maxAtk * 0.7 ? -4 : 6))
-      .attr('y', baseYScale(d.defense) + 3)
-      .attr('text-anchor', d.attack > maxAtk * 0.7 ? 'end' : 'start')
+      .attr('x', baseXScale(d.offence) + (d.offence > maxAtk * 0.7 ? -4 : 6))
+      .attr('y', baseYScale(d.defence) + 3)
+      .attr('text-anchor', d.offence > maxAtk * 0.7 ? 'end' : 'start')
       .attr('fill', typeColor(d.type1))
       .attr('font-size', '9px').attr('font-weight', '600')
       .attr('pointer-events', 'none')
       .text(d.name);
   });
 
-  // ── BRUSH layer (added before dots so dots intercept their clicks) ─
-  // Brush filter: ignore shift+drag (reserved for zoom pan) and right-click
-  const brushBehavior = d3.brush()
-    .extent([[0, 0], [iW, iH]])
-    .filter(event => !event.shiftKey && !event.button && !event.ctrlKey)
-    .on('start', () => { selectedName = null; })
-    .on('brush', function({ selection }) {
-      if (!selection || scatterMode !== 'all') return;
-      const [[x0, y0], [x1, y1]] = selection;
-      // Read dots' current rendered positions (zoom-aware) from the DOM
-      brushedNames = new Set();
-      dots.each(function(d) {
-        const cx = +this.getAttribute('cx');
-        const cy = +this.getAttribute('cy');
-        if (activeTypes.has(d.type1) &&
-            cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1) {
-          brushedNames.add(d.name);
-        }
-      });
-      dots.attr('opacity', d => !activeTypes.has(d.type1) ? 0 :
-        brushedNames.has(d.name) ? 0.95 : 0.06)
-        .attr('stroke', d => brushedNames.has(d.name) ? '#222' : '#fff')
-        .attr('stroke-width', d => brushedNames.has(d.name) ? 1.5 : 0.4);
-      if (updaters.bar) updaters.bar();
-      if (updaters.pcp) updaters.pcp();
-    })
-    .on('end', function({ selection }) {
-      if (!selection) {
-        brushedNames = null;
-        if (updaters.bar)     updaters.bar();
-        if (updaters.scatter) updaters.scatter();
-        if (updaters.pcp)     updaters.pcp();
-      }
-    });
-  const brushG = g.append('g').attr('class', 'brush-layer').call(brushBehavior);
+  // ── LASSO: freehand polygon selection ─────────────────────
+  let lassoPoints  = [];
+  let lassoActive  = false;
+  let lassoWasDrag = false;
+
+  // Hull layer — convex-hull polygons per type (sits UNDER dots in SVG order)
+  const hullG = g.append('g').attr('class', 'hull-layer');
+
+  // Transparent overlay catches background mousedown to start the lasso.
+  // It lives under the dots; a click on a dot goes to the dot first (stopPropagation).
+  const lassoOverlay = g.append('rect')
+    .attr('class', 'lasso-overlay')
+    .attr('width', iW).attr('height', iH)
+    .attr('fill', 'transparent')
+    .style('cursor', 'crosshair');
 
   // ── DOTS (persistent across modes) ─────────────────────────
   const dots = g.selectAll('.dot').data(data).join('circle')
     .attr('class', 'dot')
-    .attr('cx', d => xScale(d.attack)).attr('cy', d => yScale(d.defense))
+    .attr('cx', d => xScale(d.offence)).attr('cy', d => yScale(d.defence))
     .attr('r',  d => rScale(d.total))
     .attr('fill', d => typeColor(d.type1)).attr('opacity', 0.65)
     .attr('stroke', '#fff').attr('stroke-width', 0.4)
     .attr('display', d => activeTypes.has(d.type1) ? null : 'none')
+    .on('mousedown', function(event) {
+      // Stop mousedown from reaching the brush overlay — prevents brush start
+      // from wiping selectedName when the user clicks a dot.
+      event.stopPropagation();
+    })
     .on('click', function(event, d) {
       event.stopPropagation();
       brushedNames = null;
       selectedName = (selectedName === d.name) ? null : d.name;
-      g.select('.brush-layer').call(brushBehavior.move, null);
+      clearLasso();
       if (updaters.bar)     updaters.bar();
       if (updaters.scatter) updaters.scatter();
       if (updaters.pcp)     updaters.pcp();
     })
     .on('mouseover', function(event, d) {
-      d3.select(this).raise().attr('stroke', '#222').attr('stroke-width', 1.8).attr('opacity', 1);
+      // No visual change on hover — tooltip only. Prevents accidental highlights
+      // when moving the mouse across the scatter.
       tip.transition().duration(80).style('opacity', 0.95);
       let html = `<strong>${d.name}</strong><br>` +
         `Type: ${d.type1}${d.type2 ? ' / ' + d.type2 : ''}<br>` +
-        `ATK&nbsp;${d.attack}&ensp;·&ensp;DEF&nbsp;${d.defense}&ensp;·&ensp;Total&nbsp;${d.total}`;
+        `Offence (ATK+SpATK)&nbsp;${d.offence}&ensp;·&ensp;Defence (HP+DEF+SpDEF)&nbsp;${d.defence}`;
       if (scatterMode === 'type') {
         const a = typeAvgsMap.get(d.type1);
-        html += `<br><span style="color:${typeColor(d.type1)}">${d.type1} group:</span> ${a.count} Pokémon · avg ATK ${a.attack.toFixed(1)} · avg DEF ${a.defense.toFixed(1)}`;
+        html += `<br><span style="color:${typeColor(d.type1)}">${d.type1} group:</span> ${a.count} Pokémon · avg Off ${a.offence.toFixed(1)} · avg Def ${a.defence.toFixed(1)}`;
       } else if (scatterMode === 'kmeans') {
         const i  = data.indexOf(d);
         const c  = centroids[labels[i]];
@@ -486,35 +487,93 @@ function drawScatter(data) {
     .on('mousemove', event => {
       tip.style('left', (event.pageX + 14) + 'px').style('top', (event.pageY - 34) + 'px');
     })
-    .on('mouseout', function(event, d) {
-      const isSel = selectedName === d.name;
-      // Recompute target opacity using full interaction state (bug fix: defaultOp
-      // ignores selectedName/brushedNames, causing hovered dots to restore wrong opacity)
-      const targetOp = (() => {
-        if (!activeTypes.has(d.type1)) return 0;
-        if (isSel) return 1;
-        if (brushedNames !== null) return brushedNames.has(d.name) ? 0.95 : 0.06;
-        if (selectedName !== null) return 0.06;   // another dot is selected
-        return defaultOp(scatterMode);
-      })();
-      d3.select(this)
-        .attr('stroke', isSel ? '#222' : '#fff')
-        .attr('stroke-width', isSel ? 2 : 0.4)
-        .attr('opacity', targetOp);
+    .on('mouseout', function() {
       tip.transition().duration(150).style('opacity', 0);
     });
+
+  // ── Lasso path (on top of dots — shows freehand outline while drawing) ──
+  const lassoPath = g.append('path')
+    .attr('class', 'lasso-path')
+    .attr('fill', 'rgba(99,144,240,0.10)')
+    .attr('stroke', '#6390F0')
+    .attr('stroke-width', 1.5)
+    .attr('stroke-dasharray', '4,2')
+    .attr('pointer-events', 'none')
+    .attr('d', '');
+
+  function clearLasso() {
+    lassoPath.attr('d', '');
+    lassoPoints = [];
+    lassoActive = false;
+  }
+
+  // Wire the lasso overlay now that lassoPath + clearLasso are defined
+  lassoOverlay.on('mousedown', function(event) {
+    if (event.shiftKey || event.button !== 0) return;   // shift = pan
+    if (scatterMode !== 'all') return;                   // only in individual mode
+    selectedName = null;
+    lassoActive  = true;
+    lassoWasDrag = false;
+    lassoPoints  = [d3.pointer(event, g.node())];
+    event.preventDefault();
+    d3.select(window)
+      .on('mousemove.lasso', function(ev) {
+        if (!lassoActive) return;
+        lassoWasDrag = true;
+        const [mx, my] = d3.pointer(ev, g.node());
+        lassoPoints.push([Math.max(0, Math.min(iW, mx)), Math.max(0, Math.min(iH, my))]);
+        lassoPath.attr('d', `M${lassoPoints.map(p => p.join(',')).join('L')}Z`);
+      })
+      .on('mouseup.lasso', function() {
+        if (!lassoActive) return;
+        lassoActive = false;
+        d3.select(window).on('mousemove.lasso', null).on('mouseup.lasso', null);
+        if (lassoWasDrag && lassoPoints.length > 3) {
+          // Apply lasso — test which dots fall inside the polygon
+          const newSel = new Set();
+          dots.each(function(d) {
+            if (!activeTypes.has(d.type1)) return;
+            if (d3.polygonContains(lassoPoints,
+                [+this.getAttribute('cx'), +this.getAttribute('cy')])) {
+              newSel.add(d.name);
+            }
+          });
+          brushedNames = newSel.size > 0 ? newSel : null;
+          if (brushedNames) {
+            dots.attr('opacity', d => !activeTypes.has(d.type1) ? 0 :
+                brushedNames.has(d.name) ? 0.95 : 0.06)
+              .attr('stroke', d => brushedNames.has(d.name) ? '#222' : '#fff')
+              .attr('stroke-width', d => brushedNames.has(d.name) ? 1.5 : 0.4);
+            if (updaters.bar) updaters.bar();
+            if (updaters.pcp) updaters.pcp();
+          } else {
+            clearLasso();
+            if (updaters.bar)     updaters.bar();
+            if (updaters.scatter) updaters.scatter();
+            if (updaters.pcp)     updaters.pcp();
+          }
+        } else {
+          // Bare click on background — clear everything
+          brushedNames = null;
+          clearLasso();
+          if (updaters.bar)     updaters.bar();
+          if (updaters.scatter) updaters.scatter();
+          if (updaters.pcp)     updaters.pcp();
+        }
+      });
+  });
 
   // ── Type centroid decorations (rings + labels) ────────────
   const typeDecor = g.append('g').attr('class', 'type-decor').style('opacity', scatterMode === 'type' ? 1 : 0);
   typeDecor.selectAll('.type-ring').data(typeAvgsArr).join('circle')
     .attr('class', 'type-ring')
-    .attr('cx', d => xScale(d.attack)).attr('cy', d => yScale(d.defense))
+    .attr('cx', d => xScale(d.offence)).attr('cy', d => yScale(d.defence))
     .attr('r', 14)
     .attr('fill', 'none').attr('stroke', d => typeColor(d.type)).attr('stroke-width', 2)
     .attr('opacity', 0.7);
   typeDecor.selectAll('.type-label').data(typeAvgsArr).join('text')
     .attr('class', 'type-label')
-    .attr('x', d => xScale(d.attack)).attr('y', d => yScale(d.defense) - 18)
+    .attr('x', d => xScale(d.offence)).attr('y', d => yScale(d.defence) - 18)
     .attr('text-anchor', 'middle')
     .attr('fill', d => typeColor(d.type))
     .attr('font-size', '10px').attr('font-weight', '700')
@@ -524,14 +583,14 @@ function drawScatter(data) {
   const kmDecor = g.append('g').attr('class', 'km-decor').style('opacity', scatterMode === 'kmeans' ? 1 : 0);
   kmDecor.selectAll('.cluster-ring').data(centroids).join('circle')
     .attr('class', 'cluster-ring')
-    .attr('cx', d => xScale(d.attack)).attr('cy', d => yScale(d.defense))
+    .attr('cx', d => xScale(d.offence)).attr('cy', d => yScale(d.defence))
     .attr('r', d => countScale(d.count))
     .attr('fill', (_, i) => CLUSTER_COLORS[i]).attr('opacity', 0.1)
     .attr('stroke', (_, i) => CLUSTER_COLORS[i]).attr('stroke-width', 2);
   kmDecor.selectAll('.cluster-label').data(centroids).join('text')
     .attr('class', 'cluster-label')
-    .attr('x', d => xScale(d.attack))
-    .attr('y', d => yScale(d.defense) - countScale(d.count) - 4)
+    .attr('x', d => xScale(d.offence))
+    .attr('y', d => yScale(d.defence) - countScale(d.count) - 4)
     .attr('text-anchor', 'middle')
     .attr('fill', (_, i) => CLUSTER_COLORS[i])
     .attr('font-size', '11px').attr('font-weight', '700')
@@ -539,60 +598,63 @@ function drawScatter(data) {
 
   // ── Mode application (the morph) ─────────────────────────
   function applyMode() {
-    g.select('.brush-layer').call(brushBehavior.move, null);
+    clearLasso();
 
     // Hide/show outlier labels — only meaningful in Individual mode
     outlierG.style('display', scatterMode === 'all' ? null : 'none');
 
-    const typeKeys = [...typeAvgsMap.keys()];
-
     if (scatterMode === 'type') {
-      // ── TYPE AVERAGES: "peel-off" approach ───────────────────
-      // Show destination rings immediately so the user sees where each type
-      // is heading BEFORE the dots start moving.
+      // ── TYPE AVERAGES: convex-hull approach ───────────────────
+      // Dots stay at their individual positions (showing the actual spread)
+      // and fade to near-invisible. A convex hull per type fades in to
+      // reveal the region each type occupies in offence–defence space.
       typeDecor.style('opacity', 1);
       kmDecor.style('opacity', 0);
 
-      // Fade background dots to 0.15 (faint but visible — scatter context)
-      dots.transition().duration(500).attr('opacity', d => activeTypes.has(d.type1) ? 0.15 : 0);
+      const RESET_MS  = 350;   // return dots to individual positions (from kmeans)
+      const FADE_OUT  = 200;   // fade dots to near-invisible
+      const HULL_BASE = RESET_MS + FADE_OUT + 50;  // hulls start appearing after
+      const HULL_STAG = 55;    // stagger per type
+      const HULL_DUR  = 300;   // each hull fade-in duration
 
-      // Per type: pause 900ms to see the rings, then peel off one by one
-      const T_GAP       = 600;  // pause after rings appear
-      const DOT_DELAY   = 10;   // ms between each individual dot's start
-      const DOT_MOVE    = 700;  // travel duration per dot
+      // Interrupt any ongoing kmeans transitions, snap dots back to their
+      // individual positions, then fade them out
+      dots.interrupt()
+        .transition().duration(RESET_MS).ease(d3.easeCubicInOut)
+          .attr('cx', d => xScale(d.offence))
+          .attr('cy', d => yScale(d.defence))
+          .attr('r',  d => rScale(d.total))
+        .transition().duration(FADE_OUT)
+          .attr('opacity', d => activeTypes.has(d.type1) ? 0.12 : 0);
 
-      // Collect each dot's current screen position and sort spatially:
-      // top-left → top-right, then row by row (like reading order).
-      const NUM_ROWS  = 18;
-      const rowHeight = iH / NUM_ROWS;
-      const dotEntries = [];
-      dots.each(function(d) {
-        if (!activeTypes.has(d.type1)) return;
-        dotEntries.push({ el: this, datum: d,
-          cx: +this.getAttribute('cx'),
-          cy: +this.getAttribute('cy') });
-      });
-      dotEntries.sort((a, b) => {
-        const ra = Math.floor(a.cy / rowHeight);
-        const rb = Math.floor(b.cy / rowHeight);
-        return ra !== rb ? ra - rb : a.cx - b.cx;
-      });
-
-      // Animate each dot individually toward its type centroid
-      dotEntries.forEach(({ el, datum }, i) => {
-        const avg = typeAvgsMap.get(datum.type1);
-        d3.select(el)
-          .transition()
-          .delay(T_GAP + i * DOT_DELAY)
-          .duration(DOT_MOVE)
-          .ease(d3.easeCubicInOut)
-          .attr('cx', xScale(avg.attack))
-          .attr('cy', yScale(avg.defense))
-          .attr('opacity', 0.8);
+      // Clear any previous hulls then draw one per active type
+      hullG.selectAll('.type-hull').remove();
+      [...typeAvgsMap.keys()].filter(t => activeTypes.has(t)).forEach((type, ti) => {
+        const pts  = data.filter(d => d.type1 === type);
+        if (pts.length < 3) return;
+        const hull = d3.polygonHull(pts.map(d => [d.offence, d.defence]));
+        if (!hull) return;
+        hullG.append('path')
+          .attr('class', 'type-hull')
+          .attr('data-type', type)
+          .attr('fill', typeColor(type))
+          .attr('stroke', typeColor(type))
+          .attr('stroke-width', 1.5)
+          .attr('fill-opacity', 0)
+          .attr('stroke-opacity', 0)
+          .attr('pointer-events', 'none')
+          .attr('d', `M${hull.map(([o, e]) => `${xScale(o)},${yScale(e)}`).join('L')}Z`)
+          .transition().delay(HULL_BASE + ti * HULL_STAG).duration(HULL_DUR)
+            .attr('fill-opacity', 0.13)
+            .attr('stroke-opacity', 0.75);
       });
 
     } else if (scatterMode === 'kmeans') {
-      // ── K-MEANS: dim-then-flash approach (user confirmed speed is good) ──
+      // ── K-MEANS: fade hulls out first, then dim-then-flash ──
+      hullG.selectAll('.type-hull').interrupt()
+        .transition().duration(200)
+          .attr('fill-opacity', 0).attr('stroke-opacity', 0)
+          .remove();
       typeDecor.style('opacity', 0);
       kmDecor.style('opacity', 1); // show cluster rings immediately
 
@@ -618,15 +680,22 @@ function drawScatter(data) {
       });
 
     } else {
-      // ── Return to Individual: all dots scatter back simultaneously ──
+      // ── Return to Individual ──
+      // Fade out and remove any hulls
+      hullG.selectAll('.type-hull').interrupt()
+        .transition().duration(200)
+          .attr('fill-opacity', 0).attr('stroke-opacity', 0)
+          .remove();
       typeDecor.transition().duration(400).style('opacity', 0);
       kmDecor.transition().duration(400).style('opacity', 0);
 
-      dots.transition().duration(MORPH_MS).ease(d3.easeCubicInOut)
-        .attr('cx', (d, i) => xScale(dataPos(d, i, 'all').a))
-        .attr('cy', (d, i) => yScale(dataPos(d, i, 'all').e))
-        .attr('r',  (d, i) => rFor(d, i, 'all'))
-        .attr('opacity', d => !activeTypes.has(d.type1) ? 0 : defaultOp('all'));
+      // Animate dots back to their individual positions
+      dots.interrupt()
+        .transition().duration(MORPH_MS).ease(d3.easeCubicInOut)
+          .attr('cx', d => xScale(d.offence))
+          .attr('cy', d => yScale(d.defence))
+          .attr('r',  d => rScale(d.total))
+          .attr('opacity', d => !activeTypes.has(d.type1) ? 0 : defaultOp('all'));
     }
   }
   scatterApplyMode = applyMode;
@@ -643,6 +712,11 @@ function drawScatter(data) {
       .attr('stroke', d => selectedName === d.name ? '#222' : '#fff')
       .attr('stroke-width', d => selectedName === d.name ? 2 : 0.4)
       .attr('display', d => activeTypes.has(d.type1) ? null : 'none');
+    // Hide hulls for type-toggled-off types
+    hullG.selectAll('.type-hull').each(function() {
+      const type = this.getAttribute('data-type');
+      d3.select(this).attr('display', activeTypes.has(type) ? null : 'none');
+    });
   };
 
   // ── Axes (kept as refs so zoom can rescale them) ─────────
@@ -658,11 +732,11 @@ function drawScatter(data) {
   g.append('text').attr('class', 'axis-label')
     .attr('x', iW / 2).attr('y', iH + 38)
     .attr('text-anchor', 'middle').attr('fill', '#666').attr('font-size', '12px')
-    .text('Attack');
+    .text('Offence (Attack + Sp.Atk)');
   g.append('text').attr('class', 'axis-label')
     .attr('transform', 'rotate(-90)').attr('x', -iH / 2).attr('y', -40)
     .attr('text-anchor', 'middle').attr('fill', '#666').attr('font-size', '12px')
-    .text('Defense');
+    .text('Defence (HP + Defense + Sp.Def)');
 
   // ── PAN/ZOOM (wheel = zoom, shift+drag = pan; brush handles regular drag) ──
   // Clip path so zoomed/panned dots don't render outside the plot area
@@ -676,29 +750,41 @@ function drawScatter(data) {
     xScale = t.rescaleX(baseXScale);
     yScale = t.rescaleY(baseYScale);
 
-    // Move dots based on current mode (no transition — zoom is interactive)
-    dots.attr('cx', (d, i) => xScale(dataPos(d, i, scatterMode).a))
-        .attr('cy', (d, i) => yScale(dataPos(d, i, scatterMode).e));
+    // In type mode dots stay at their individual positions (hulls show grouping)
+    const zoomMode = scatterMode === 'type' ? 'all' : scatterMode;
+    dots.attr('cx', (d, i) => xScale(dataPos(d, i, zoomMode).a))
+        .attr('cy', (d, i) => yScale(dataPos(d, i, zoomMode).e));
 
     // Move type decorations
     typeDecor.selectAll('.type-ring')
-      .attr('cx', d => xScale(d.attack)).attr('cy', d => yScale(d.defense));
+      .attr('cx', d => xScale(d.offence)).attr('cy', d => yScale(d.defence));
     typeDecor.selectAll('.type-label')
-      .attr('x', d => xScale(d.attack)).attr('y', d => yScale(d.defense) - 18);
+      .attr('x', d => xScale(d.offence)).attr('y', d => yScale(d.defence) - 18);
 
     // Move cluster decorations
     kmDecor.selectAll('.cluster-ring')
-      .attr('cx', d => xScale(d.attack)).attr('cy', d => yScale(d.defense));
+      .attr('cx', d => xScale(d.offence)).attr('cy', d => yScale(d.defence));
     kmDecor.selectAll('.cluster-label')
-      .attr('x', d => xScale(d.attack))
-      .attr('y', d => yScale(d.defense) - countScale(d.count) - 4);
+      .attr('x', d => xScale(d.offence))
+      .attr('y', d => yScale(d.defence) - countScale(d.count) - 4);
 
-    // Reference line
+    // Reference diagonal (defence = offence + meanHP)
     atkDefLine
-      .attr('x1', xScale(0)).attr('y1', yScale(0))
-      .attr('x2', xScale(refMax)).attr('y2', yScale(refMax));
+      .attr('x1', xScale(0)).attr('y1', yScale(meanHP))
+      .attr('x2', xScale(diagEndX)).attr('y2', yScale(diagEndX + meanHP));
     atkDefLabel
-      .attr('x', xScale(refMax) - 4).attr('y', yScale(refMax) - 6);
+      .attr('x', xScale(diagEndX) - 4).attr('y', yScale(diagEndX + meanHP) - 6);
+
+    // Reposition hull polygons (type-avg mode)
+    hullG.selectAll('.type-hull').each(function() {
+      const type = this.getAttribute('data-type');
+      const pts  = data.filter(d => d.type1 === type);
+      if (pts.length < 3) return;
+      const hull = d3.polygonHull(pts.map(d => [d.offence, d.defence]));
+      if (!hull) return;
+      d3.select(this).attr('d',
+        `M${hull.map(([o, e]) => `${xScale(o)},${yScale(e)}`).join('L')}Z`);
+    });
 
     // Axes
     xAxisG.call(d3.axisBottom(xScale).ticks(6))
@@ -1000,6 +1086,7 @@ function drawPCP(data) {
     hitLines.attr('pointer-events', d => {
       if (pcpMode !== 'all') return 'none';
       if (selectedName !== null) return d.name === selectedName ? 'auto' : 'none';
+      if (brushedNames !== null) return brushedNames.has(d.name) ? 'auto' : 'none';
       return 'auto';
     });
 

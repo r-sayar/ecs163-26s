@@ -13,7 +13,7 @@
     <header id="header">
       <h1>Pokémon Stats Dashboard</h1>
       <span id="subtitle">
-        Drag scatter to brush · Click dot or PCP line to select · Switch modes to morph dots into groups
+        Draw lasso to select · Click dot or PCP line to select · Switch modes to explore groupings
       </span>
     </header>
 
@@ -29,7 +29,7 @@
       <!-- View 2 (Focus): Attack vs Defense scatter — brush + click select -->
       <section id="view-scatter" class="view">
         <div class="view-header">
-          <h2 class="view-title">Focus: Attack vs. Defense &nbsp;<span class="hint">drag = brush · click = select · wheel = zoom · ⇧+drag = pan</span></h2>
+          <h2 class="view-title">Focus: Offence vs. Defence &nbsp;<span class="hint">draw lasso = select · click = select · wheel = zoom · ⇧+drag = pan</span></h2>
           <div id="scatter-controls">
             <button class="toggle-btn active" data-mode="all"    onclick="setScatterMode('all')">Individual Pokémon</button>
             <button class="toggle-btn"        data-mode="type"   onclick="setScatterMode('type')">Type Averages</button>
@@ -57,6 +57,6 @@
 
   <!-- D3.js v7 from CDN -->
   <script src="https://d3js.org/d3.v7.min.js"></script>
-  <script src="main.js?v=15"></script>
+  <script src="main.js?v=20"></script>
 </body>
 </html>
