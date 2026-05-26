@@ -57,11 +57,12 @@ function dims(id) {
 // ── Global state ──────────────────────────────────────────────
 const activeTypes = new Set(ALL_TYPES);
 let scatterMode = 'all';
-let pcpMode     = 'type';
+let pcpMode     = 'all';        // default: Individual Pokémon
 let pokemonData = [];
 let nameToType1 = new Map();
 let brushedNames = null;        // Set<string> | null
 let selectedName = null;        // string | null
+let scatterTimeouts = [];       // pending type-animation setTimeout IDs
 const updaters = { bar: null, scatter: null, pcp: null };
 
 // Mode-morph callbacks exposed by drawScatter / drawPCP so that
@@ -598,56 +599,132 @@ function drawScatter(data) {
 
   // ── Mode application (the morph) ─────────────────────────
   function applyMode() {
+    // Cancel any pending type-spotlight setTimeout callbacks
+    scatterTimeouts.forEach(id => clearTimeout(id));
+    scatterTimeouts = [];
     clearLasso();
 
     // Hide/show outlier labels — only meaningful in Individual mode
     outlierG.style('display', scatterMode === 'all' ? null : 'none');
 
     if (scatterMode === 'type') {
-      // ── TYPE AVERAGES: convex-hull approach ───────────────────
-      // Dots stay at their individual positions (showing the actual spread)
-      // and fade to near-invisible. A convex hull per type fades in to
-      // reveal the region each type occupies in offence–defence space.
+      // ── TYPE AVERAGES: spotlight-then-hull approach ──────────────
+      // For each type one at a time:
+      //   1. Dim all other types' dots to near-invisible; highlight this type.
+      //   2. Within this type, fade interior dots further — only the hull-
+      //      boundary dots (the outermost Pokémon) stay bright, showing
+      //      exactly which ones define the convex hull.
+      //   3. The hull polygon fades in over those boundary dots.
+      //   Repeat for all 18 types, then settle everything to faint.
+      // Hull fill intensity is proportional to type count (more Pokémon → more opaque).
       typeDecor.style('opacity', 1);
       kmDecor.style('opacity', 0);
 
-      const RESET_MS  = 350;   // return dots to individual positions (from kmeans)
-      const FADE_OUT  = 200;   // fade dots to near-invisible
-      const HULL_BASE = RESET_MS + FADE_OUT + 50;  // hulls start appearing after
-      const HULL_STAG = 55;    // stagger per type
-      const HULL_DUR  = 300;   // each hull fade-in duration
+      const RESET_MS   = 280;  // snap dots back to individual positions
+      const DIM_DUR    = 150;  // highlight/dim transition
+      const INNER_DUR  = 110;  // interior-dots fade
+      const HULL_DUR   = 230;  // hull polygon fade-in
+      // Per-type slot durations: fast drop for first few, then constant
+      const PER_TYPE_STEPS = [1500, 1000, 500]; // types 1,2,3
+      const PER_TYPE_REST  = 400;               // type 4 onward
 
-      // Interrupt any ongoing kmeans transitions, snap dots back to their
-      // individual positions, then fade them out
+      // Reset dots to individual positions (important when coming from k-means)
       dots.interrupt()
         .transition().duration(RESET_MS).ease(d3.easeCubicInOut)
           .attr('cx', d => xScale(d.offence))
           .attr('cy', d => yScale(d.defence))
-          .attr('r',  d => rScale(d.total))
-        .transition().duration(FADE_OUT)
-          .attr('opacity', d => activeTypes.has(d.type1) ? 0.12 : 0);
+          .attr('r',  d => rScale(d.total));
 
-      // Clear any previous hulls then draw one per active type
+      // Remove any previous hulls
       hullG.selectAll('.type-hull').remove();
-      [...typeAvgsMap.keys()].filter(t => activeTypes.has(t)).forEach((type, ti) => {
+
+      // Pre-compute convex hull + boundary Pokémon per type
+      const hullPaths      = new Map();   // type → hull point array
+      const hullBoundary   = new Map();   // type → Set<name> of boundary Pokémon
+
+      const typeCounts = [...typeAvgsMap.values()].map(v => v.count);
+      const minCnt = Math.min(...typeCounts);
+      const maxCnt = Math.max(...typeCounts);
+      // Fill-opacity scales with count (denser types = more opaque hull)
+      const hullFillOp = type => {
+        const cnt = typeAvgsMap.get(type).count;
+        return 0.08 + 0.15 * (cnt - minCnt) / Math.max(maxCnt - minCnt, 1);
+      };
+
+      [...typeAvgsMap.keys()].forEach(type => {
         const pts  = data.filter(d => d.type1 === type);
-        if (pts.length < 3) return;
-        const hull = d3.polygonHull(pts.map(d => [d.offence, d.defence]));
-        if (!hull) return;
-        hullG.append('path')
-          .attr('class', 'type-hull')
-          .attr('data-type', type)
-          .attr('fill', typeColor(type))
-          .attr('stroke', typeColor(type))
-          .attr('stroke-width', 1.5)
-          .attr('fill-opacity', 0)
-          .attr('stroke-opacity', 0)
-          .attr('pointer-events', 'none')
-          .attr('d', `M${hull.map(([o, e]) => `${xScale(o)},${yScale(e)}`).join('L')}Z`)
-          .transition().delay(HULL_BASE + ti * HULL_STAG).duration(HULL_DUR)
-            .attr('fill-opacity', 0.13)
-            .attr('stroke-opacity', 0.75);
+        const hull = pts.length >= 3 ? d3.polygonHull(pts.map(d => [d.offence, d.defence])) : null;
+        hullPaths.set(type, hull);
+        if (hull) {
+          const hullKey = new Set(hull.map(([o, e]) => `${o},${e}`));
+          hullBoundary.set(type,
+            new Set(pts.filter(d => hullKey.has(`${d.offence},${d.defence}`)).map(d => d.name)));
+        } else {
+          hullBoundary.set(type, new Set());
+        }
       });
+
+      const activeTypeList = [...typeAvgsMap.keys()].filter(t => activeTypes.has(t));
+      const N = activeTypeList.length;
+
+      // Pre-compute each type's start time
+      let cumDelay = RESET_MS + 40;
+      const typeStartTimes = activeTypeList.map((_, ti) => {
+        const t0 = cumDelay;
+        const perType = ti < PER_TYPE_STEPS.length ? PER_TYPE_STEPS[ti] : PER_TYPE_REST;
+        cumDelay += perType;
+        return t0;
+      });
+
+      activeTypeList.forEach((type, ti) => {
+        const t0      = typeStartTimes[ti];
+        const boundary = hullBoundary.get(type);
+
+        // Step 1: spotlight — dim all other types, highlight this one
+        scatterTimeouts.push(setTimeout(() => {
+          dots.interrupt('op')
+            .transition('op').duration(DIM_DUR).ease(d3.easeLinear)
+            .attr('opacity', d => {
+              if (!activeTypes.has(d.type1)) return 0;
+              return d.type1 === type ? 0.85 : 0.04;
+            });
+        }, t0));
+
+        // Step 2: within this type, dim interior dots — boundary dots stay bright
+        scatterTimeouts.push(setTimeout(() => {
+          dots.filter(d => d.type1 === type)
+            .interrupt('op')
+            .transition('op').duration(INNER_DUR).ease(d3.easeLinear)
+            .attr('opacity', d => boundary.has(d.name) ? 0.90 : 0.20);
+        }, t0 + DIM_DUR));
+
+        // Step 3: hull polygon fades in over the boundary dots
+        scatterTimeouts.push(setTimeout(() => {
+          const hull = hullPaths.get(type);
+          if (!hull) return;
+          hullG.append('path')
+            .attr('class', 'type-hull')
+            .attr('data-type', type)
+            .attr('fill', typeColor(type))
+            .attr('stroke', typeColor(type))
+            .attr('stroke-width', 1.5)
+            .attr('fill-opacity', 0)
+            .attr('stroke-opacity', 0)
+            .attr('pointer-events', 'none')
+            .attr('d', `M${hull.map(([o, e]) => `${xScale(o)},${yScale(e)}`).join('L')}Z`)
+            .transition().duration(HULL_DUR)
+              .attr('fill-opacity', hullFillOp(type))
+              .attr('stroke-opacity', 0.82);
+        }, t0 + DIM_DUR + INNER_DUR));
+      });
+
+      // Final: all dots settle to uniform faint state (after last type is done)
+      const tFinal = cumDelay + 100;
+      scatterTimeouts.push(setTimeout(() => {
+        dots.interrupt('op')
+          .transition('op').duration(320)
+          .attr('opacity', d => activeTypes.has(d.type1) ? 0.12 : 0);
+      }, tFinal));
 
     } else if (scatterMode === 'kmeans') {
       // ── K-MEANS: fade hulls out first, then dim-then-flash ──
